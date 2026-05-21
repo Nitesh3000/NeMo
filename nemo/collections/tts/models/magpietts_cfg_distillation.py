@@ -31,7 +31,11 @@ from nemo.collections.tts.losses.magpietts_cfg_distillation import (
     NRMSELogitsLoss,
 )
 from nemo.collections.tts.models.magpietts import ContextTensorsOutput, MagpieTTSModel
-from nemo.collections.tts.modules.magpietts_modules import EOSDetectionMethod, remove_embedded_eos_token
+from nemo.collections.tts.modules.magpietts_modules import (
+    EOSDetectionMethod,
+    clear_forbidden_logits,
+    remove_embedded_eos_token,
+)
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.lightning.callback_group import CallbackGroup
 from nemo.utils import logging
@@ -69,6 +73,8 @@ class _DefaultParams:
     truncation_weight: Optional[float] = 0.1
     # Weight coefficient for the MoE loss component.
     moe_loss_weight: float = 1.0
+
+    distill_local_transformer: bool = True
 
 
 _DEFAULT_PARAMS = _DefaultParams()
@@ -204,10 +210,19 @@ def _process_moe_routing_info(
     }
 
 
+@dataclass(frozen=True)
+class _StudentOutput:
+
+    logits: Tensor
+    moe_routing_data: Optional[dict[str, Tensor]]
+    logits_lt: Optional[Tensor]
+
+
 def _process_batch_student(
     model: MagpieTTSModel,
     batch: dict[str, Tensor | list],
-) -> tuple[Tensor, Optional[dict[str, Tensor]]]:
+    use_lt: bool,
+) -> _StudentOutput:
     """Perform a teacher-forced forward decoding pass for a MagpieTTS student model.
 
     This method runs a standard forward pass without classifier-free guidance (CFG).
@@ -237,6 +252,7 @@ def _process_batch_student(
     audio_codes_lens = batch["audio_codes_lens"]
     dec_context_size = context_tensors.dec_context_size
     moe_routing_data = None
+    logits_lt = None
 
     audio_codes_embedded_all, audio_codes_lens_all = model.embed_audio_tokens(
         audio_tokens=audio_codes,
@@ -248,7 +264,7 @@ def _process_batch_student(
     )
     audio_codes_mask = get_mask_from_lengths(audio_codes_lens_)
     inputs = _prepare_forward_inputs(model, context_tensors, audio_codes_embedded, audio_codes_mask)
-    logits, _, _, moe_routing_info = model.forward(**inputs)
+    logits, _, dec_out, moe_routing_info = model.forward(**inputs)
     logits = logits[:, dec_context_size:, :]
 
     if model.use_moe and moe_routing_info is not None:
@@ -256,12 +272,118 @@ def _process_batch_student(
             moe_routing_info=moe_routing_info,
             dec_input_mask=inputs["dec_input_mask"],
         )
-    return logits, moe_routing_data
+
+    if use_lt:
+        logits_lt = model._lt_helper.compute_logits(
+            dec_out=dec_out[:, dec_context_size:, :].detach(),
+            audio_codes_target=batch["audio_codes_lt"],
+            targets_offset_by_one=False,
+        )
+
+    return _StudentOutput(
+        logits=logits,
+        moe_routing_data=moe_routing_data,
+        logits_lt=logits_lt,
+    )
+
+
+def _lt_sample_autoregressive(
+    model: MagpieTTSModel,
+    dec_output: torch.Tensor,
+    temperature: float = 0.7,
+    topk: int = 80,
+    unfinished_items: dict[int, bool] = {},
+    finished_items: dict[int, bool] = {},
+    cfg_scale: float = 1.0,
+    use_kv_cache: bool = True,
+    forbid_audio_eos: bool = False,
+    sanitize_logits: bool = False,
+) -> torch.Tensor:
+    model.local_transformer.reset_cache(use_cache=use_kv_cache)
+    dec_output = dec_output.unsqueeze(1)
+    local_transformer_input = model.local_transformer_in_projection(dec_output)
+    predicted_codes = []
+    predicted_logits = []
+
+    for codebook_num in range(model.num_audio_codebooks * model.frame_stacking_factor):
+        size = (local_transformer_input.size(0), local_transformer_input.size(1))
+        _mask = torch.ones(*size, device=local_transformer_input.device)
+        local_transformer_output = model.local_transformer(local_transformer_input, _mask)["output"]
+
+        lt_out_for_proj = model.local_transformer_audio_out_projection(local_transformer_output[:, -1, :])
+        codebook_logits = model.local_transformer_out_projections[codebook_num](lt_out_for_proj)
+
+        bs = codebook_logits.size(0) // 2
+        conditional_logits = codebook_logits[:bs]
+        unconditional_logits = codebook_logits[bs:]
+        cfg_logits = cfg_scale * conditional_logits + (1.0 - cfg_scale) * unconditional_logits
+        codebook_logits[:bs] = cfg_logits
+        predicted_logits.append(codebook_logits.clone())
+
+        if sanitize_logits:
+            codebook_logits = torch.nan_to_num(codebook_logits, nan=0.0, posinf=100.0, neginf=-100.0)
+            codebook_logits = codebook_logits.clamp(min=-100.0, max=100.0)
+
+        for item_idx in unfinished_items:
+            codebook_logits[item_idx, model.audio_eos_id] = float("-inf")
+
+        for item_idx in finished_items:
+            codebook_logits[item_idx, :] = float("-inf")
+            codebook_logits[item_idx, model.audio_eos_id] = 0.0
+
+        codebook_logits = clear_forbidden_logits(
+            logits=codebook_logits.unsqueeze(1),
+            codebook_size=model.codebook_size,
+            forbid_audio_eos=forbid_audio_eos,
+        )
+        codebook_logits = codebook_logits.squeeze(1)
+
+        codebook_logits_topk = torch.topk(codebook_logits, topk, dim=-1)[0]
+        indices_to_remove = codebook_logits < codebook_logits_topk[:, -1].unsqueeze(-1)
+        codebook_logits_rescored = codebook_logits.clone()
+        codebook_logits_rescored[indices_to_remove] = float("-inf")
+
+        if temperature <= 0.0:
+            codebook_preds = codebook_logits_rescored.argmax(dim=-1, keepdim=True)
+        else:
+            codebook_probs = torch.softmax(codebook_logits_rescored / temperature, dim=-1)
+            codebook_preds = torch.multinomial(codebook_probs, 1)
+
+        codebook_preds[bs:] = codebook_preds[:bs]
+        predicted_codes.append(codebook_preds)
+
+        next_local_transformer_input = model.audio_embeddings[codebook_num](codebook_preds.squeeze(-1)).unsqueeze(1)
+        next_local_transformer_input = model.audio_in_projection(next_local_transformer_input)
+        next_local_transformer_input = model.local_transformer_in_projection(next_local_transformer_input)
+        local_transformer_input = torch.cat([local_transformer_input, next_local_transformer_input], dim=1)
+
+    predicted_codes = torch.cat(predicted_codes, dim=1)
+    predicted_logits = torch.cat(predicted_logits, dim=1)
+    dims = (-1, model.frame_stacking_factor, model.num_audio_codebooks)
+    predicted_codes = predicted_codes.reshape(*dims).permute(0, 2, 1)
+
+    predicted_codes = predicted_codes[:bs]
+    predicted_logits = predicted_logits[:bs]
+
+    return predicted_codes, predicted_logits
+
+
+@dataclass(frozen=True)
+class _TeacherOutput:
+
+    codes: Tensor
+    logits: Tensor
+    lens: Tensor
+    sample_weights: Optional[Tensor]
+
+    codes_lt: Optional[Tensor]
+    logits_lt: Optional[Tensor]
 
 
 def _infer_batch_teacher(
     model: MagpieTTSModel,
     batch: dict[str, Tensor | list],
+    use_lt: bool,
     max_decoder_steps: int = 500,
     temperature: float = 0.7,
     topk: int = 80,
@@ -271,7 +393,7 @@ def _infer_batch_teacher(
     use_kv_cache: bool = False,
     eos_detection_method: str = "argmax_or_multinomial_any",
     min_generated_frames: int = 4,
-) -> tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
+) -> _TeacherOutput:
     """Perform autoregressive batch inference for a MagpieTTS teacher model.
 
     This method generates audio token rollouts conditioned on text and context inputs.
@@ -331,6 +453,7 @@ def _infer_batch_teacher(
     audio_codes_input = torch.full(dims, model.audio_bos_id, device=device).long()
     audio_codes_lens = torch.full((bs,), fs_factor, device=device).long()
     truncation_count = 0
+    predicted_codes_lt, predicted_codes_logits_lt = None, None
 
     if truncation_weight is None:
         sample_weights = None
@@ -349,8 +472,8 @@ def _infer_batch_teacher(
             context_tensors.additional_decoder_mask,
         )
     )
-    predicted_codes_logits = []
-    predictions = []
+    predicted_codes_logits, predicted_codes_logits_lt = [], []
+    predictions, predictions_lt = [], []
     # Stores the start of the final retained stacked block.
     end_indices = {}
     attn_prior = [None, None] if model.model_type == "multi_encoder_context_tts" else None
@@ -381,7 +504,7 @@ def _infer_batch_teacher(
                 cfg_audio_codes_embedded[bs:, :index] = dummy_additional_decoder_input
                 cfg_audio_codes_mask[bs:, :index] = dummy_addition_dec_mask
 
-            combined_logits, _, _, _ = model.forward(
+            combined_logits, _, dec_out, _ = model.forward(
                 dec_input_embedded=cfg_audio_codes_embedded,
                 dec_input_mask=cfg_audio_codes_mask,
                 cond=cfg_cond,
@@ -391,23 +514,33 @@ def _infer_batch_teacher(
             )
             cond_logits = combined_logits[:bs]
             uncond_logits = combined_logits[bs:]
-            all_code_logits = (1 - cfg_scale) * uncond_logits + cfg_scale * cond_logits
+            logits = (1 - cfg_scale) * uncond_logits + cfg_scale * cond_logits
             forbid_audio_eos = idx * fs_factor < min_generated_frames
-            all_code_logits_t = all_code_logits[:, -1, :]
-            predicted_codes_logits.append(all_code_logits_t.unsqueeze(1))
+            logits_t = logits[:, -1, :]
+            predicted_codes_logits.append(logits_t.unsqueeze(1))
 
             audio_codes_next = model.sample_codes_from_logits(
-                all_code_logits_t,
+                logits_t,
                 temperature=temperature,
                 topk=topk,
                 forbid_audio_eos=forbid_audio_eos,
             )
             all_codes_next_argmax = model.sample_codes_from_logits(
-                all_code_logits_t,
+                logits_t,
                 temperature=0.01,
                 topk=1,
                 forbid_audio_eos=forbid_audio_eos,
             )
+            if use_lt:
+                audio_codes_next_lt, logits_t_lt = _lt_sample_autoregressive(
+                    model=model,
+                    dec_output=dec_out[:, -1, :],
+                    temperature=temperature,
+                    topk=topk,
+                    cfg_scale=cfg_scale,
+                    use_kv_cache=use_kv_cache,
+                    forbid_audio_eos=forbid_audio_eos,
+                )
 
             for item_idx in range(bs):
                 if item_idx in end_indices:
@@ -439,6 +572,10 @@ def _infer_batch_teacher(
             audio_codes_input = torch.cat([audio_codes_input, audio_codes_next], dim=-1)
             audio_codes_lens = audio_codes_lens + fs_factor
 
+            if use_lt:
+                predictions_lt.append(audio_codes_next_lt)
+                predicted_codes_logits_lt.append(logits_t_lt.unsqueeze(1))
+
             if len(end_indices) == bs and len(predictions) >= 4:
                 msg = "All ends reached"
                 if truncation_threshold is not None:
@@ -458,10 +595,23 @@ def _infer_batch_teacher(
         predicted_codes = predicted_codes[:, :, :max_len]
         predicted_codes_logits = predicted_codes_logits[:, :max_stacked_len, :]
 
+        if use_lt:
+            predicted_codes_lt = torch.cat(predictions_lt, dim=-1)
+            predicted_codes_lt = predicted_codes_lt[:, :, :max_len]
+            predicted_codes_logits_lt = torch.cat(predicted_codes_logits_lt, dim=1)
+            predicted_codes_logits_lt = predicted_codes_logits_lt[:, :max_stacked_len, :]
+
     model.decoder.reset_cache(use_cache=False)
     torch.cuda.empty_cache()
 
-    return predicted_codes, predicted_codes_logits, predicted_codes_lens, sample_weights
+    return _TeacherOutput(
+        codes=predicted_codes,
+        logits=predicted_codes_logits,
+        lens=predicted_codes_lens,
+        sample_weights=sample_weights,
+        codes_lt=predicted_codes_lt,
+        logits_lt=predicted_codes_logits_lt,
+    )
 
 
 def _collect_validation_outputs(
@@ -632,16 +782,22 @@ class OnlineCFGDistillation(MagpieTTSModel):
     def _update_batch(
         self,
         batch: dict[str, Tensor | list],
-        rollout_codes: Tensor,
-        rollout_lens: Tensor,
+        teacher_output: _TeacherOutput,
     ) -> dict[str, Tensor | list]:
         rollout_codes = torch.nn.functional.pad(
-            input=rollout_codes,
+            input=teacher_output.codes,
             pad=(self.frame_stacking_factor, 0),
             value=self.audio_bos_id,
         )
         batch["audio_codes"] = rollout_codes
-        batch["audio_codes_lens"] = rollout_lens + self.frame_stacking_factor
+        batch["audio_codes_lens"] = teacher_output.lens + self.frame_stacking_factor
+
+        if self.distill_local_transformer:
+            if teacher_output.codes_lt is None:
+                raise ValueError()
+
+            batch["audio_codes_lt"] = teacher_output.codes_lt
+
         return batch
 
     def _compute_loss(
@@ -734,7 +890,7 @@ class OnlineCFGDistillation(MagpieTTSModel):
         """
         batch = self._add_batch_audio_codes(batch)
 
-        rollout_codes, rollout_logits, rollout_lens, sample_weights = _infer_batch_teacher(
+        teacher_output = _infer_batch_teacher(
             model=self._teacher_model,
             batch=batch,
             max_decoder_steps=self.max_decoder_steps,
@@ -744,23 +900,28 @@ class OnlineCFGDistillation(MagpieTTSModel):
             truncation_threshold=self.truncation_threshold if mode == "train" else None,
             truncation_weight=self.truncation_weight if mode == "train" else None,
             use_kv_cache=self.use_kv_cache_during_rollout,
+            use_lt=self.distill_local_transformer,
         )
 
-        batch = self._update_batch(batch, rollout_codes, rollout_lens)
-        student_logits, moe_routing_data = _process_batch_student(model=self, batch=batch)
-        mask = get_mask_from_lengths(rollout_lens)
+        batch = self._update_batch(batch, teacher_output)
 
-        if self.distillation_temperature != 1.0:
-            student_logits = student_logits / self.distillation_temperature
-            rollout_logits = rollout_logits / self.distillation_temperature
+        student_output = _process_batch_student(
+            model=self,
+            batch=batch,
+            use_lt=self.distill_local_transformer,
+        )
+        mask = get_mask_from_lengths(teacher_output.lens)
+
+        student_logits = student_output.logits / self.distillation_temperature
+        rollout_logits = teacher_output.logits / self.distillation_temperature
 
         output = self._compute_loss(
-            teacher_codes=rollout_codes,
+            teacher_codes=teacher_output.codes,
             teacher_logits=rollout_logits,
             student_logits=student_logits,
             mask=mask,
-            sample_weights=sample_weights,
-            moe_routing_data=moe_routing_data,
+            sample_weights=teacher_output.sample_weights,
+            moe_routing_data=student_output.moe_routing_data,
         )
         return output
 
