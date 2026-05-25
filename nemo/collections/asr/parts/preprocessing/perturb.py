@@ -56,7 +56,7 @@ HAVE_OMEGACONG_WEBDATASET = True
 try:
     from omegaconf import DictConfig, OmegaConf
 
-    from nemo.utils import webdataset as wds
+    import webdataset as wds
 
 except ModuleNotFoundError:
     from nemo.utils.exceptions import LightningNotInstalledException
